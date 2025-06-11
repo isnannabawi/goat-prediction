@@ -9,12 +9,13 @@ import warnings
 # PyTorch dan torchvision
 import torch
 from torchvision import models, transforms
+from torchvision.models import efficientnet_b0
 from torch.utils.data import DataLoader, Dataset
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import f1_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from tqdm import tqdm
+import xgboost as xgb
 
 # Style dan warning
 plt.style.use('fivethirtyeight')
@@ -40,9 +41,12 @@ df_labels['file_path'] = df_labels['filename'].apply(lambda x: train_dir / x)
 le = LabelEncoder()
 df_labels['encoded_label'] = le.fit_transform(df_labels['label'])
 
-# Transformasi gambar
+# Transformasi gambar dengan augmentasi ringan
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(10),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2),
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406],
                          [0.229, 0.224, 0.225])
@@ -65,28 +69,29 @@ class ImageDataset(Dataset):
 train_dataset = ImageDataset(df_labels, transform)
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=False)
 
-# Load ResNet18 dan hapus FC layer terakhir
+# Load EfficientNetB0 dan hapus classifier layer
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-resnet = models.resnet18(pretrained=True)
-resnet = torch.nn.Sequential(*list(resnet.children())[:-1])  # remove FC
-resnet.to(device)
-resnet.eval()
+effnet = efficientnet_b0(pretrained=True)
+effnet.classifier = torch.nn.Identity()  # remove classifier layer
+effnet.to(device)
+effnet.eval()
 
 # Ekstrak fitur
-def extract_features(dataloader):
+def extract_features(dataloader, model):
     features, labels = [], []
     with torch.no_grad():
         for imgs, lbls in tqdm(dataloader, desc="🔍 Extracting features"):
             imgs = imgs.to(device)
-            feats = resnet(imgs).squeeze(-1).squeeze(-1)
+            feats = model(imgs).squeeze()
             features.append(feats.cpu().numpy())
             labels.append(lbls.numpy())
     return np.vstack(features), np.concatenate(labels)
 
-X, y = extract_features(train_loader)
+X, y = extract_features(train_loader, effnet)
 X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
 
-clf = RandomForestClassifier(n_estimators=200, random_state=42)
+# XGBoost classifier
+clf = xgb.XGBClassifier(n_estimators=300, max_depth=6, use_label_encoder=False, eval_metric='mlogloss')
 clf.fit(X_train, y_train)
 y_pred = clf.predict(X_val)
 
@@ -108,26 +113,32 @@ class TestDataset(Dataset):
 
 # Load test data
 test_image_paths = sorted(list(test_dir.glob("*.jpg")))
-test_dataset = TestDataset(test_image_paths, transform)
+test_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406],
+                         [0.229, 0.224, 0.225])
+])
+test_dataset = TestDataset(test_image_paths, test_transform)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
 # Ekstrak fitur test
-def extract_test_features(dataloader):
+def extract_test_features(dataloader, model):
     feats = []
     with torch.no_grad():
         for imgs in tqdm(dataloader, desc="📸 Extracting test features"):
             imgs = imgs.to(device)
-            f = resnet(imgs).squeeze(-1).squeeze(-1)
+            f = model(imgs).squeeze()
             feats.append(f.cpu().numpy())
     return np.vstack(feats)
 
-X_test = extract_test_features(test_loader)
+X_test = extract_test_features(test_loader, effnet)
 test_preds = clf.predict(X_test)
 test_labels = le.inverse_transform(test_preds)
 
 submission_df = pd.DataFrame({
     "filename": [p.name for p in test_image_paths],
-    "label": test_labels
+    "predicted_label": test_labels
 })
 submission_df.to_csv("test_predictions.csv", index=False)
 print("📄 Prediksi test disimpan ke test_predictions.csv")
